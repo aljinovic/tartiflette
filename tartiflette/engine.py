@@ -18,7 +18,11 @@ from typing import (
 
 from tartiflette.constants import UNDEFINED_VALUE
 from tartiflette.execution.collect import parse_and_validate_query
-from tartiflette.execution.execute import create_source_event_stream, execute
+from tartiflette.execution.execute import (
+    create_source_event_stream,
+    execute,
+    execute_serial,
+)
 from tartiflette.execution.response import build_response
 from tartiflette.schema.bakery import SchemaBakery
 from tartiflette.schema.registry import SchemaRegistry
@@ -157,9 +161,13 @@ class Engine:
         coerce_list_concurrently=None,
         coerce_parent_concurrently=None,
         sdl_file_encoding=None,
+        execute_serially=False,
     ) -> None:
         """
         Creates an uncooked Engine instance.
+        :param execute_serially: if True, fields are resolved serially one by one
+        without using asyncio.gather for concurrent execution
+        :type execute_serially: bool
         """
         # pylint: disable=too-many-arguments
         self._schema = None
@@ -186,6 +194,7 @@ class Engine:
         self._cached_parse_and_validate_query = None
         self._json_loader = json_loader or default_json_module.loads
         self._sdl_file_encoding = sdl_file_encoding
+        self._execute_serially = execute_serially
 
     async def cook(
         self,
@@ -203,6 +212,7 @@ class Engine:
         coerce_parent_concurrently: Optional[bool] = None,
         schema_name: Optional[str] = None,
         sdl_file_encoding: Optional[str] = None,
+        execute_serially: Optional[bool] = None,
     ) -> None:
         """
         Cook the tartiflette, basically prepare the engine by binding it to
@@ -233,6 +243,8 @@ class Engine:
         :param schema_name: name of the SDL
         :param sdl_file_encoding: file encoding of the SDL, if different from
         `locale.getpreferredencoding(False)`
+        :param execute_serially: if True, fields are resolved serially one by one
+        without using asyncio.gather for concurrent execution
         :type sdl: Union[str, List[str]]
         :type error_coercer: Callable[[Exception, Dict[str, Any]], Dict[str, Any]]
         :type custom_default_resolver: Optional[Callable]
@@ -245,6 +257,7 @@ class Engine:
         :type coerce_parent_concurrently: Optional[bool]
         :type schema_name: Optional[str]
         :type sdl_file_encoding: Optional[str]
+        :type execute_serially: Optional[bool]
         """
         # pylint: disable=too-many-arguments,too-many-locals
         if self._cooked:
@@ -353,6 +366,11 @@ class Engine:
         )
 
         self._schema.json_loader = json_loader or self._json_loader
+        
+        # Update execute_serially if provided in cook()
+        if execute_serially is not None:
+            self._execute_serially = execute_serially
+        
         self._cooked = True
 
     async def _perform_subscription(
@@ -408,6 +426,17 @@ class Engine:
         if request_parsing_errors:
             return await self._build_response(errors=request_parsing_errors)
 
+        if self._execute_serially:
+            return await execute_serial(
+                schema,
+                document,
+                self._build_response,
+                initial_value,
+                context,
+                variables,
+                operation_name,
+            )
+
         return await execute(
             schema,
             document,
@@ -428,6 +457,8 @@ class Engine:
     ) -> Dict[str, Any]:
         """
         Parses and executes a GraphQL query/mutation request.
+        Uses serial execution if execute_serially=True was set during engine
+        initialization or cooking.
         :param query: the GraphQL request / query as UTF8-encoded string
         :param operation_name: the operation name to execute
         :param context: value that can contain everything you need and that
@@ -458,6 +489,62 @@ class Engine:
                 variables,
                 initial_value,
                 context_coercer=context,
+            )
+        # pylint: disable=broad-except
+        except Exception as e:
+            if not isinstance(e, TartifletteError):
+                e = TartifletteError(
+                    message=str(e),
+                    path=[self._schema.query_operation_name],
+                    original_error=e,
+                )
+            return await self._build_response(errors=[e])
+
+    async def execute_serial(
+        self,
+        query: Union[str, bytes],
+        operation_name: Optional[str] = None,
+        context: Optional[Any] = None,
+        variables: Optional[Dict[str, Any]] = None,
+        initial_value: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """
+        Parses and executes a GraphQL query/mutation request with serial field
+        resolution. All fields are resolved one by one, without using asyncio.gather
+        for concurrent execution.
+        :param query: the GraphQL request / query as UTF8-encoded string
+        :param operation_name: the operation name to execute
+        :param context: value that can contain everything you need and that
+        will be accessible from the resolvers
+        :param variables: the variables provided in the GraphQL request
+        :param initial_value: an initial value corresponding to the root type
+        being executed
+        :type query: Union[str, bytes]
+        :type operation_name: Optional[str]
+        :type context: Optional[Any]
+        :type variables: Optional[Dict[str, Any]]
+        :type initial_value: Optional[Any]
+        :return: computed response corresponding to the request
+        :rtype: Dict[str, Any]
+        """
+        document, errors = self._cached_parse_and_validate_query(
+            query, self._schema
+        )
+
+        # Handle parsing/validation errors
+        if errors:
+            return await self._build_response(errors=errors)
+
+        # Execute with serial field resolution (bypasses schema directives)
+        try:
+            return await execute_serial(
+                self._schema,
+                document,
+                self._build_response,
+                initial_value,
+                context,
+                variables,
+                operation_name,
             )
         # pylint: disable=broad-except
         except Exception as e:

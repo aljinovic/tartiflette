@@ -36,6 +36,7 @@ async def create_engine(
     coerce_list_concurrently: Optional[bool] = None,
     coerce_parent_concurrently: Optional[bool] = None,
     sdl_file_encoding: Optional[str] = None,
+    execute_serially: bool = False,
 ) -> "Engine":
     """
     Create an engine by analyzing the SDL and connecting it with the imported
@@ -66,6 +67,8 @@ async def create_engine(
     concurrently
     :param sdl_file_encoding: file encoding of the SDL, if different from
     `locale.getpreferredencoding(False)`
+    :param execute_serially: if True, fields are resolved serially one by one
+    without using asyncio.gather for concurrent execution
     :type sdl: Union[str, List[str]]
     :type schema_name: str
     :type error_coercer: Callable[[Exception, Dict[str, Any]], Dict[str, Any]]
@@ -78,6 +81,7 @@ async def create_engine(
     :type coerce_list_concurrently: Optional[bool]
     :type coerce_parent_concurrently: Optional[bool]
     :type sdl_file_encoding: Optional[str]
+    :type execute_serially: bool
     :return: a Cooked Engine instance
     :rtype: Engine
 
@@ -91,7 +95,7 @@ async def create_engine(
     >>> }''')
     """
     # pylint: disable=too-many-arguments
-    e = Engine()
+    e = Engine(execute_serially=execute_serially)
 
     await e.cook(
         sdl=sdl,

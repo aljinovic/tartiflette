@@ -41,7 +41,20 @@ def get_output_coercer(
         inner_type = wrapped_type
 
     try:
-        coercer = inner_type.output_coercer
+        # When concurrently=False (serial mode), use serial coercers for objects
+        # We need to construct the same structure as inner_type.output_coercer but with object_coercer_serial
+        if not concurrently and hasattr(inner_type, 'kind') and inner_type.kind == "OBJECT":
+            from tartiflette.coercers.outputs.object_coercer import object_coercer_serial
+            from tartiflette.coercers.outputs.directives_coercer import output_directives_coercer
+            # Match the structure of inner_type.output_coercer:
+            # partial(output_directives_coercer, coercer=partial(object_coercer, object_type=self), directives=...)
+            coercer = partial(
+                output_directives_coercer,
+                coercer=partial(object_coercer_serial, object_type=inner_type),
+                directives=inner_type.pre_output_coercion_directives,
+            )
+        else:
+            coercer = inner_type.output_coercer
     except AttributeError:
         # This case should never happen and raise an exception at schema
         # validation time.
