@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Any, Callable, List, Union
 
 from tartiflette.coercers.arguments import coerce_arguments
@@ -183,128 +184,123 @@ async def resolve_field_value_or_error_serial(
     """
     # pylint: disable=too-many-locals
     try:
+        # Cache frequently accessed attributes
+        raw_resolver = field_definition.raw_resolver
+        is_default_resolver = raw_resolver is None
+        schema = execution_context.schema
+        variable_values = execution_context.variable_values
+        context = execution_context.context
+        field_node = field_nodes[0]  # Cache first field node (most common case)
+        field_arguments = field_definition.arguments  # Cache arguments dict
+        arguments_coercer = field_definition.arguments_coercer  # Cache coercer
+        is_introspection = info.is_introspection  # Cache introspection flag
+        
+        # Optimize directive computation: use list comprehension and early exit
         computed_directives = []
-        for field_node in field_nodes:
-            computed_directives.extend(
-                compute_directive_nodes(
-                    execution_context.schema,
-                    field_node.directives,
-                    execution_context.variable_values,
+        for field_node_item in field_nodes:
+            directive_nodes = field_node_item.directives
+            if directive_nodes:  # Early exit if no directives
+                computed_directives.extend(
+                    compute_directive_nodes(
+                        schema,
+                        directive_nodes,
+                        variable_values,
+                    )
                 )
-            )
-
-        # Check if this is the default resolver (no custom resolver defined)
-        is_default_resolver = field_definition.raw_resolver is None
         
-        # Check if the raw resolver is async (before wrapping)
-        raw_resolver_is_async = False
-        if not is_default_resolver and field_definition.raw_resolver:
-            raw_resolver_is_async = is_valid_coroutine(field_definition.raw_resolver)
+        has_directives = bool(computed_directives)
         
-        # Determine which resolver to use
-        # The resolver parameter passed in is the resolver extracted from field_definition.resolver
-        # which may already be wrapped with resolver_executor at bake time (via wraps_with_directives).
-        # We need to check if it's wrapped to know whether to pass context_coercer.
-        from functools import partial
-        resolver_from_bake_is_wrapped = (
-            isinstance(resolver, partial) 
-            and hasattr(resolver, 'func') 
+        # Fast path: default resolver without directives and not wrapped
+        # Check if resolver is wrapped with resolver_executor at bake time
+        resolver_is_wrapped = (
+            isinstance(resolver, partial)
+            and hasattr(resolver, 'func')
             and resolver.func is resolver_executor
         )
         
-        # Check for runtime directives
-        has_directives = bool(computed_directives)
+        # Optimize common case: default resolver, no directives, not wrapped
+        if is_default_resolver and not resolver_is_wrapped and not has_directives:
+            # Fast path: use sync default resolver directly
+            coerced_args = await coerce_arguments(
+                field_arguments,
+                field_node,
+                variable_values,
+                context,
+                coercer=arguments_coercer,
+            )
+            
+            result = default_field_resolver_sync(
+                source,
+                coerced_args,
+                context,
+                info,
+            )
+            
+            if is_introspection:
+                return await introspection_directives_executor(
+                    result,
+                    context,
+                    info,
+                    context_coercer=context,
+                )
+            return result
         
-        # Always use the resolver passed in (extracted from field_definition.resolver.keywords['resolver'])
-        # At bake time, this resolver is wrapped with resolver_executor via wraps_with_directives(is_resolver=True)
-        # So it should always be wrapped, except in edge cases
-        # For default resolvers, we can optimize by using sync version if not wrapped and no directives
+        # Handle directives case
         resolver_to_use = resolver
-        
-        # Only replace with sync default resolver if:
-        # 1. It's a default resolver (raw_resolver is None)
-        # 2. The extracted resolver is NOT wrapped (shouldn't happen normally, but handle edge case)
-        # 3. No runtime directives
-        if is_default_resolver and not resolver_from_bake_is_wrapped and not has_directives:
-            # Use sync default resolver for optimization
-            resolver_to_use = default_field_resolver_sync
-
         if has_directives:
-            # Ensure resolver_executor is applied when wrapping with directives
-            # wraps_with_directives only wraps with resolver_executor if func is not a partial,
-            # but we need it wrapped to handle context_coercer. So we wrap it manually first.
-            # We always wrap with resolver_executor when directives are present to ensure
-            # context_coercer is properly handled (popped before reaching the resolver).
-            from functools import partial
-            
-            # Check if resolver_to_use is already wrapped with resolver_executor
-            needs_wrapper = True
-            if isinstance(resolver_to_use, partial) and hasattr(resolver_to_use, 'func'):
-                if resolver_to_use.func is resolver_executor:
-                    # Already wrapped with resolver_executor - don't double-wrap
-                    needs_wrapper = False
-            
-            if needs_wrapper:
-                # Always wrap with resolver_executor when directives are present
-                # This ensures context_coercer is handled even if resolver is already a partial
+            # Check if resolver is already wrapped with resolver_executor
+            if not resolver_is_wrapped:
                 resolver_to_use = partial(resolver_executor, resolver_to_use)
             
             resolver_to_use = wraps_with_directives(
                 directives_definition=computed_directives,
                 directive_hook="on_field_execution",
                 func=resolver_to_use,
-                is_resolver=False,  # Already wrapped with resolver_executor above (or was already wrapped)
+                is_resolver=False,  # Already wrapped with resolver_executor if needed
                 with_default=True,
             )
+        elif is_default_resolver and not resolver_is_wrapped:
+            # Default resolver without directives: use sync version
+            resolver_to_use = default_field_resolver_sync
 
         coerced_args = await coerce_arguments(
-            field_definition.arguments,
-            field_nodes[0],
-            execution_context.variable_values,
-            execution_context.context,
-            coercer=field_definition.arguments_coercer,
+            field_arguments,
+            field_node,
+            variable_values,
+            context,
+            coercer=arguments_coercer,
         )
         
-        # Call resolver - match regular executor behavior exactly
-        # The regular executor ALWAYS passes context_coercer to ALL resolvers (line 80)
-        # resolver_executor wrapper will pop it if not needed
-        # Only sync default resolver without directives and without wrapper can be called synchronously
-        # All other resolvers (including wrapped ones) need await and context_coercer
-        is_sync_default_unwrapped = (
-            resolver_to_use is default_field_resolver_sync and
-            not has_directives
-        )
+        # Determine if we can call synchronously
+        # If resolver_to_use is default_field_resolver_sync, we're in the elif branch
+        # which means not has_directives, so we can call synchronously
+        is_sync_call = resolver_to_use is default_field_resolver_sync
         
-        if is_sync_default_unwrapped:
+        if is_sync_call:
             # Sync default resolver - no await, no context_coercer
             result = resolver_to_use(
                 source,
                 coerced_args,
-                execution_context.context,
+                context,
                 info,
             )
         else:
-            # ALL other resolvers: always pass context_coercer (matches regular executor exactly)
-            # This includes:
-            # - Custom resolvers (wrapped with resolver_executor at bake time)
-            # - Default resolver with directives (wrapped with resolver_executor)
-            # - Any async resolver
-            # - Any resolver wrapped with resolver_executor
-            # resolver_executor wrapper will pop context_coercer if not needed
+            # All other resolvers: always pass context_coercer
+            # resolver_executor wrapper will pop it if not needed
             result = await resolver_to_use(
                 source,
                 coerced_args,
-                execution_context.context,
+                context,
                 info,
-                context_coercer=execution_context.context,
+                context_coercer=context,
             )
         
-        if info.is_introspection:
+        if is_introspection:
             return await introspection_directives_executor(
                 result,
-                execution_context.context,
+                context,
                 info,
-                context_coercer=execution_context.context,
+                context_coercer=context,
             )
         return result
     except Exception as e:  # pylint: disable=broad-except
