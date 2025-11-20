@@ -9,7 +9,7 @@ from tartiflette.types.exceptions.tartiflette import (
 )
 from tartiflette.types.helpers.definition import get_wrapped_type
 from tartiflette.types.helpers.type import get_graphql_type
-from tartiflette.utils.callables import is_valid_coroutine
+from tartiflette.utils.callables import is_sync_callable, is_valid_coroutine
 
 __all__ = ("Resolver",)
 
@@ -104,9 +104,15 @@ class Resolver:
         :return: the implementation of the resolver
         :rtype: Callable
         """
-        if not is_valid_coroutine(implementation):
+        # Accept both sync and async resolvers
+        if not callable(implementation):
+            raise NonCallable(
+                f"The resolver `{repr(implementation)}` given is not callable."
+            )
+        
+        if not (is_valid_coroutine(implementation) or is_sync_callable(implementation)):
             raise NonAwaitableResolver(
-                f"The resolver `{repr(implementation)}` given is not awaitable."
+                f"The resolver `{repr(implementation)}` given is neither awaitable nor a valid synchronous callable."
             )
 
         if self._type_resolver is not None and not callable(

@@ -11,8 +11,9 @@ from tartiflette.resolver.default import default_field_resolver_sync
 from tartiflette.types.helpers.get_directive_instances import (
     compute_directive_nodes,
 )
-from tartiflette.utils.callables import is_valid_coroutine
+from tartiflette.utils.callables import is_sync_callable, is_valid_coroutine
 from tartiflette.utils.directives import (
+    directive_executor,
     introspection_directives_executor,
     resolver_executor,
     wraps_with_directives,
@@ -67,19 +68,53 @@ async def resolve_field_value_or_error(
                 with_default=True,
             )
 
-        result = await resolver(
-            source,
-            await coerce_arguments(
-                field_definition.arguments,
-                field_nodes[0],
-                execution_context.variable_values,
-                execution_context.context,
-                coercer=field_definition.arguments_coercer,
-            ),
+        coerced_args = await coerce_arguments(
+            field_definition.arguments,
+            field_nodes[0],
+            execution_context.variable_values,
             execution_context.context,
-            info,
-            context_coercer=execution_context.context,
+            coercer=field_definition.arguments_coercer,
         )
+        
+        # Check if resolver is wrapped (with resolver_executor or directive_executor)
+        # Both wrappers handle sync/async detection internally and are async themselves
+        is_wrapped_with_executor = (
+            isinstance(resolver, partial)
+            and hasattr(resolver, 'func')
+            and resolver.func is resolver_executor
+        )
+        is_wrapped_with_directive = (
+            isinstance(resolver, partial)
+            and hasattr(resolver, 'func')
+            and resolver.func is directive_executor
+        )
+        
+        if computed_directives or is_wrapped_with_directive or is_wrapped_with_executor:
+            # Wrapped resolver - always await (wrappers handle sync/async internally)
+            result = await resolver(
+                source,
+                coerced_args,
+                execution_context.context,
+                info,
+                context_coercer=execution_context.context,
+            )
+        elif is_sync_callable(resolver):
+            # Sync resolver without directives - call directly
+            result = resolver(
+                source,
+                coerced_args,
+                execution_context.context,
+                info,
+            )
+        else:
+            # Async resolver without directives
+            result = await resolver(
+                source,
+                coerced_args,
+                execution_context.context,
+                info,
+                context_coercer=execution_context.context,
+            )
         if info.is_introspection:
             return await introspection_directives_executor(
                 result,
@@ -211,11 +246,11 @@ async def resolve_field_value_or_error_serial(
         has_directives = bool(computed_directives)
         
         # Fast path: default resolver without directives and not wrapped
-        # Check if resolver is wrapped with resolver_executor at bake time
+        # Check if resolver is wrapped with resolver_executor or directive_executor at bake time
         resolver_is_wrapped = (
             isinstance(resolver, partial)
             and hasattr(resolver, 'func')
-            and resolver.func is resolver_executor
+            and (resolver.func is resolver_executor or resolver.func is directive_executor)
         )
         
         # Optimize common case: default resolver, no directives, not wrapped
@@ -272,12 +307,30 @@ async def resolve_field_value_or_error_serial(
         )
         
         # Determine if we can call synchronously
-        # If resolver_to_use is default_field_resolver_sync, we're in the elif branch
-        # which means not has_directives, so we can call synchronously
-        is_sync_call = resolver_to_use is default_field_resolver_sync
+        # Check if resolver is wrapped with directive_executor (when directives are present)
+        # directive_executor is async and always needs to be awaited
+        is_wrapped_with_directive = (
+            isinstance(resolver_to_use, partial)
+            and hasattr(resolver_to_use, 'func')
+            and resolver_to_use.func is directive_executor
+        )
+        is_wrapped_with_executor = (
+            isinstance(resolver_to_use, partial)
+            and hasattr(resolver_to_use, 'func')
+            and resolver_to_use.func is resolver_executor
+        )
         
-        if is_sync_call:
-            # Sync default resolver - no await, no context_coercer
+        if has_directives or is_wrapped_with_directive or is_wrapped_with_executor:
+            # Wrapped resolver (with directives or executor) - always await (wrapper handles sync/async)
+            result = await resolver_to_use(
+                source,
+                coerced_args,
+                context,
+                info,
+                context_coercer=context,
+            )
+        elif resolver_to_use is default_field_resolver_sync or is_sync_callable(resolver_to_use):
+            # Sync resolver (default or custom) without directives - call directly without await
             result = resolver_to_use(
                 source,
                 coerced_args,
@@ -285,8 +338,7 @@ async def resolve_field_value_or_error_serial(
                 info,
             )
         else:
-            # All other resolvers: always pass context_coercer
-            # resolver_executor wrapper will pop it if not needed
+            # Async resolver without directives - await it
             result = await resolver_to_use(
                 source,
                 coerced_args,
