@@ -162,12 +162,17 @@ class Engine:
         coerce_parent_concurrently=None,
         sdl_file_encoding=None,
         execute_serially=False,
+        skip_resolved_field_default_resolver=True,
     ) -> None:
         """
         Creates an uncooked Engine instance.
         :param execute_serially: if True, fields are resolved serially one by one
         without using asyncio.gather for concurrent execution
+        :param skip_resolved_field_default_resolver: if True, enable the optimization
+        that tries to get field values directly from source objects before calling
+        the resolver
         :type execute_serially: bool
+        :type skip_resolved_field_default_resolver: bool
         """
         # pylint: disable=too-many-arguments
         self._schema = None
@@ -195,6 +200,7 @@ class Engine:
         self._json_loader = json_loader or default_json_module.loads
         self._sdl_file_encoding = sdl_file_encoding
         self._execute_serially = execute_serially
+        self._skip_resolved_field_default_resolver = skip_resolved_field_default_resolver
 
     async def cook(
         self,
@@ -213,6 +219,7 @@ class Engine:
         schema_name: Optional[str] = None,
         sdl_file_encoding: Optional[str] = None,
         execute_serially: Optional[bool] = None,
+        skip_resolved_field_default_resolver: Optional[bool] = None,
     ) -> None:
         """
         Cook the tartiflette, basically prepare the engine by binding it to
@@ -245,6 +252,9 @@ class Engine:
         `locale.getpreferredencoding(False)`
         :param execute_serially: if True, fields are resolved serially one by one
         without using asyncio.gather for concurrent execution
+        :param skip_resolved_field_default_resolver: if True, enable the optimization
+        that tries to get field values directly from source objects before calling
+        the resolver
         :type sdl: Union[str, List[str]]
         :type error_coercer: Callable[[Exception, Dict[str, Any]], Dict[str, Any]]
         :type custom_default_resolver: Optional[Callable]
@@ -258,6 +268,7 @@ class Engine:
         :type schema_name: Optional[str]
         :type sdl_file_encoding: Optional[str]
         :type execute_serially: Optional[bool]
+        :type skip_resolved_field_default_resolver: Optional[bool]
         """
         # pylint: disable=too-many-arguments,too-many-locals
         if self._cooked:
@@ -315,6 +326,12 @@ class Engine:
                 "coroutine callable."
             )
 
+        skip_resolved_field_default_resolver = (
+            skip_resolved_field_default_resolver
+            if skip_resolved_field_default_resolver is not None
+            else self._skip_resolved_field_default_resolver
+        )
+
         self._error_coercer = error_coercer_factory(
             custom_error_coercer or default_error_coercer
         )
@@ -344,6 +361,7 @@ class Engine:
                 if coerce_parent_concurrently is not None
                 else self._coerce_parent_concurrently
             ),
+            skip_resolved_field_default_resolver,
         )
         self._build_response = partial(
             build_response, error_coercer=self._error_coercer

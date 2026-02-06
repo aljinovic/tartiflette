@@ -35,6 +35,7 @@ class SchemaBakery:
         custom_default_arguments_coercer: Optional[Callable] = None,
         coerce_list_concurrently: Optional[bool] = None,
         coerce_parent_concurrently: Optional[bool] = None,
+        skip_resolved_field_default_resolver: Optional[bool] = None,
     ) -> "GraphQLSchema":
         """
         Bakes and returns a GraphQLSchema instance.
@@ -50,12 +51,16 @@ class SchemaBakery:
         concurrently
         :param coerce_parent_concurrently: whether or not field will be coerced
         concurrently
+        :param skip_resolved_field_default_resolver: if True, enable the optimization
+        that tries to get field values directly from source objects before calling
+        the resolver
         :type schema_name: str
         :type custom_default_resolver: Optional[Callable]
         :type custom_default_type_resolver: Optional[Callable]
         :type custom_default_arguments_coercer: Optional[Callable]
         :type coerce_list_concurrently: Optional[bool]
         :type coerce_parent_concurrently: Optional[bool]
+        :type skip_resolved_field_default_resolver: Optional[bool]
         :return: a baked GraphQLSchema instance
         :rtype: GraphQLSchema
         """
@@ -66,5 +71,6 @@ class SchemaBakery:
             custom_default_arguments_coercer,
             coerce_list_concurrently,
             coerce_parent_concurrently,
+            skip_resolved_field_default_resolver,
         )
         return schema

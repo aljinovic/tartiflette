@@ -6,8 +6,13 @@ from tartiflette.coercers.outputs.common import (
     complete_value_catching_error,
     complete_value_catching_error_serial,
 )
+from tartiflette.coercers.outputs.common import handle_field_error
 from tartiflette.execution.types import build_resolve_info
 from tartiflette.resolver.default import default_field_resolver_sync
+from tartiflette.types.helpers.definition import (
+    get_wrapped_type,
+    is_scalar_type,
+)
 from tartiflette.types.helpers.get_directive_instances import (
     compute_directive_nodes,
 )
@@ -20,6 +25,70 @@ from tartiflette.utils.directives import (
 )
 
 __all__ = ("resolve_field", "resolve_field_serial")
+
+
+# Sentinel object for getattr default value (faster than exception handling)
+_SENTINEL = object()
+
+
+def _can_skip_scalar_coercion(
+    value: Any, scalar_type: "GraphQLScalarType"
+) -> bool:
+    """
+    Check if we can skip coercion for a scalar value when it's already the
+    correct type. This optimization works for built-in scalars where
+    coerce_output is a no-op when the value is already the correct type.
+    :param value: the value to check
+    :param scalar_type: the GraphQLScalarType instance
+    :type value: Any
+    :type scalar_type: GraphQLScalarType
+    :return: True if we can skip coercion, False otherwise
+    :rtype: bool
+    """
+    if value is None:
+        return False
+    
+    # Check for built-in scalars where coerce_output is a no-op for correct types
+    scalar_name = scalar_type.name
+    if scalar_name == "String":
+        return isinstance(value, str)
+    elif scalar_name == "Boolean":
+        return isinstance(value, bool)
+    # For other scalars (Int, Float, custom), we can't easily determine
+    # if coercion is a no-op without calling coerce_output, so we don't skip
+    return False
+
+
+def _try_get_field_from_source(source: Any, field_name: str) -> Any:
+    """
+    Try to get the field value directly from the source object.
+    Returns the value if found, None if not found or if source is None.
+    Optimized to avoid exception handling overhead in the common case.
+    :param source: the source object to check
+    :param field_name: the name of the field to retrieve
+    :type source: Any
+    :type field_name: str
+    :return: the field value if found, None otherwise
+    :rtype: Any
+    """
+    if source is None:
+        return None
+    
+    # Fast path: try attribute access first (most common case for Python objects)
+    # Using getattr with sentinel avoids exception handling overhead
+    result = getattr(source, field_name, _SENTINEL)
+    if result is not _SENTINEL:
+        return result
+    
+    # Fallback: try dict-like access
+    # Try .get() method first if available (dict, OrderedDict, etc.) - avoids KeyError
+    get_method = getattr(source, 'get', _SENTINEL)
+    if get_method is not _SENTINEL:
+        result = get_method(field_name, _SENTINEL)
+        if result is not _SENTINEL:
+            return result
+    
+    return None
 
 
 async def resolve_field_value_or_error(
@@ -49,6 +118,7 @@ async def resolve_field_value_or_error(
     """
     # pylint: disable=too-many-locals
     try:
+        # Compute directives first
         computed_directives = []
         for field_node in field_nodes:
             computed_directives.extend(
@@ -58,6 +128,30 @@ async def resolve_field_value_or_error(
                     execution_context.variable_values,
                 )
             )
+        
+        # Try to get the field value directly from the source first
+        # Only use this optimization when:
+        # 1. No directives are attached to the field
+        # 2. Field has no arguments (to ensure argument validation isn't skipped)
+        # 3. Using default resolver (to avoid bypassing custom resolver logic)
+        # 4. skip_resolved_field_default_resolver is True (optimization enabled)
+        field_value = None
+        if (not computed_directives 
+            and not field_definition.arguments 
+            and field_definition.raw_resolver is None
+            and execution_context.schema.skip_resolved_field_default_resolver):
+            field_value = _try_get_field_from_source(source, info.field_name)
+        if field_value is not None:
+            # Value already exists in source, return it
+            # Still need to handle introspection directives if present
+            if info.is_introspection and computed_directives:
+                return await introspection_directives_executor(
+                    field_value,
+                    execution_context.context,
+                    info,
+                    context_coercer=execution_context.context,
+                )
+            return field_value
 
         if computed_directives:
             resolver = wraps_with_directives(
@@ -163,6 +257,54 @@ async def resolve_field(
     :rtype: Any
     """
     # pylint: disable=too-many-arguments
+    # Early optimization: try to get field value from source before computing directives
+    # Only applies when:
+    # 1. No directives on field nodes (quick check without computing)
+    # 2. Field has no arguments
+    # 3. Using default resolver (no custom resolver)
+    # 4. Optimization flag is enabled
+    # 5. Not introspection context (introspection may need directive processing)
+    if (not any(field_node.directives for field_node in field_nodes)
+        and not field_definition.arguments
+        and field_definition.raw_resolver is None
+        and execution_context.schema.skip_resolved_field_default_resolver
+        and not is_introspection_context):
+        field_value = _try_get_field_from_source(source, field_definition.name)
+        if field_value is not None:
+            # Value found in source, build info and return coerced value
+            info = build_resolve_info(
+                execution_context,
+                field_definition,
+                field_nodes,
+                parent_type,
+                path,
+                is_introspection_context,
+            )
+            # Optimization: skip coercion for scalars when type matches
+            unwrapped_type = get_wrapped_type(field_definition.graphql_type)
+            if (is_scalar_type(unwrapped_type)
+                and _can_skip_scalar_coercion(field_value, unwrapped_type)):
+                # Handle exceptions (field_value is already known to be not None)
+                if isinstance(field_value, Exception):
+                    return handle_field_error(
+                        field_value,
+                        field_nodes,
+                        path,
+                        field_definition.graphql_type,
+                        execution_context,
+                    )
+                
+                return field_value
+            return await complete_value_catching_error(
+                field_value,
+                info,
+                execution_context,
+                field_nodes,
+                path,
+                field_definition.graphql_type,
+                output_coercer,
+            )
+    
     info = build_resolve_info(
         execution_context,
         field_definition,
@@ -172,15 +314,41 @@ async def resolve_field(
         is_introspection_context,
     )
 
+    result = await resolve_field_value_or_error(
+        execution_context,
+        field_definition,
+        field_nodes,
+        resolver,
+        source,
+        info,
+    )
+    
+    # Optimization: skip coercion for scalars when type matches
+    unwrapped_type = get_wrapped_type(field_definition.graphql_type)
+    if (is_scalar_type(unwrapped_type)
+        and _can_skip_scalar_coercion(result, unwrapped_type)):
+        # Handle exceptions and non-null validation
+        if isinstance(result, Exception):
+            return handle_field_error(
+                result,
+                field_nodes,
+                path,
+                field_definition.graphql_type,
+                execution_context,
+            )
+        # Non-null validation
+        if field_definition.graphql_type.is_non_null_type and result is None:
+            return handle_field_error(
+                ValueError("Non-null field cannot be null"),
+                field_nodes,
+                path,
+                field_definition.graphql_type,
+                execution_context,
+            )
+        return result
+    
     return await complete_value_catching_error(
-        await resolve_field_value_or_error(
-            execution_context,
-            field_definition,
-            field_nodes,
-            resolver,
-            source,
-            info,
-        ),
+        result,
         info,
         execution_context,
         field_nodes,
@@ -230,7 +398,7 @@ async def resolve_field_value_or_error_serial(
         arguments_coercer = field_definition.arguments_coercer  # Cache coercer
         is_introspection = info.is_introspection  # Cache introspection flag
         
-        # Optimize directive computation: use list comprehension and early exit
+        # Compute directives first
         computed_directives = []
         for field_node_item in field_nodes:
             directive_nodes = field_node_item.directives
@@ -242,6 +410,30 @@ async def resolve_field_value_or_error_serial(
                         variable_values,
                     )
                 )
+        
+        # Try to get the field value directly from the source first
+        # Only use this optimization when:
+        # 1. No directives are attached to the field
+        # 2. Field has no arguments (to ensure argument validation isn't skipped)
+        # 3. Using default resolver (to avoid bypassing custom resolver logic)
+        # 4. skip_resolved_field_default_resolver is True (optimization enabled)
+        field_value = None
+        if (not computed_directives 
+            and not field_arguments 
+            and is_default_resolver
+            and execution_context.schema.skip_resolved_field_default_resolver):
+            field_value = _try_get_field_from_source(source, info.field_name)
+        if field_value is not None:
+            # Value already exists in source, return it
+            # Still need to handle introspection directives if present
+            if is_introspection and computed_directives:
+                return await introspection_directives_executor(
+                    field_value,
+                    context,
+                    info,
+                    context_coercer=context,
+                )
+            return field_value
         
         has_directives = bool(computed_directives)
         
@@ -396,6 +588,53 @@ async def resolve_field_serial(
     :rtype: Any
     """
     # pylint: disable=too-many-arguments
+    # Early optimization: try to get field value from source before computing directives
+    # Only applies when:
+    # 1. No directives on field nodes (quick check without computing)
+    # 2. Field has no arguments
+    # 3. Using default resolver (no custom resolver)
+    # 4. Optimization flag is enabled
+    # 5. Not introspection context (introspection may need directive processing)
+    if (not any(field_node.directives for field_node in field_nodes)
+        and not field_definition.arguments
+        and field_definition.raw_resolver is None
+        and execution_context.schema.skip_resolved_field_default_resolver
+        and not is_introspection_context):
+        field_value = _try_get_field_from_source(source, field_definition.name)
+        if field_value is not None:
+            # Value found in source, build info and return coerced value
+            info = build_resolve_info(
+                execution_context,
+                field_definition,
+                field_nodes,
+                parent_type,
+                path,
+                is_introspection_context,
+            )
+            # Optimization: skip coercion for scalars when type matches
+            unwrapped_type = get_wrapped_type(field_definition.graphql_type)
+            if (is_scalar_type(unwrapped_type)
+                and _can_skip_scalar_coercion(field_value, unwrapped_type)):
+                # Handle exceptions (field_value is already known to be not None)
+                if isinstance(field_value, Exception):
+                    return handle_field_error(
+                        field_value,
+                        field_nodes,
+                        path,
+                        field_definition.graphql_type,
+                        execution_context,
+                    )
+                return field_value
+            return await complete_value_catching_error_serial(
+                field_value,
+                info,
+                execution_context,
+                field_nodes,
+                path,
+                field_definition.graphql_type,
+                output_coercer,
+            )
+    
     info = build_resolve_info(
         execution_context,
         field_definition,
@@ -405,15 +644,41 @@ async def resolve_field_serial(
         is_introspection_context,
     )
 
+    result = await resolve_field_value_or_error_serial(
+        execution_context,
+        field_definition,
+        field_nodes,
+        resolver,
+        source,
+        info,
+    )
+    
+    # Optimization: skip coercion for scalars when type matches
+    unwrapped_type = get_wrapped_type(field_definition.graphql_type)
+    if (is_scalar_type(unwrapped_type)
+        and _can_skip_scalar_coercion(result, unwrapped_type)):
+        # Handle exceptions and non-null validation
+        if isinstance(result, Exception):
+            return handle_field_error(
+                result,
+                field_nodes,
+                path,
+                field_definition.graphql_type,
+                execution_context,
+            )
+        # Non-null validation
+        if field_definition.graphql_type.is_non_null_type and result is None:
+            return handle_field_error(
+                ValueError("Non-null field cannot be null"),
+                field_nodes,
+                path,
+                field_definition.graphql_type,
+                execution_context,
+            )
+        return result
+    
     return await complete_value_catching_error_serial(
-        await resolve_field_value_or_error_serial(
-            execution_context,
-            field_definition,
-            field_nodes,
-            resolver,
-            source,
-            info,
-        ),
+        result,
         info,
         execution_context,
         field_nodes,

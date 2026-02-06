@@ -4,6 +4,7 @@ from typing import Any, AsyncIterable, Callable, Dict, List, Optional, Union
 
 from tartiflette.coercers.arguments import coerce_arguments
 from tartiflette.coercers.common import Path
+from tartiflette.coercers.outputs.common import complete_value_catching_error, complete_value_catching_error_serial
 from tartiflette.constants import UNDEFINED_VALUE
 from tartiflette.execution.collect import collect_fields
 from tartiflette.execution.context import build_execution_context
@@ -21,6 +22,42 @@ __all__ = (
     "execute_serial",
     "create_source_event_stream",
 )
+
+
+# Sentinel object for getattr default value (faster than exception handling)
+_SENTINEL = object()
+
+
+def _try_get_field_from_source(source: Any, field_name: str) -> Any:
+    """
+    Try to get the field value directly from the source object.
+    Returns the value if found, None if not found or if source is None.
+    Optimized to avoid exception handling overhead in the common case.
+    :param source: the source object to check
+    :param field_name: the name of the field to retrieve
+    :type source: Any
+    :type field_name: str
+    :return: the field value if found, None otherwise
+    :rtype: Any
+    """
+    if source is None:
+        return None
+    
+    # Fast path: try attribute access first (most common case for Python objects)
+    # Using getattr with sentinel avoids exception handling overhead
+    result = getattr(source, field_name, _SENTINEL)
+    if result is not _SENTINEL:
+        return result
+    
+    # Fallback: try dict-like access
+    # Try .get() method first if available (dict, OrderedDict, etc.) - avoids KeyError
+    get_method = getattr(source, 'get', _SENTINEL)
+    if get_method is not _SENTINEL:
+        result = get_method(field_name, _SENTINEL)
+        if result is not _SENTINEL:
+            return result
+    
+    return None
 
 
 async def resolve_field(
@@ -100,7 +137,6 @@ async def resolve_field_serial(
     """
     from tartiflette.resolver.factory import resolve_field_serial as factory_resolve_field_serial
     from tartiflette.execution.helpers import get_field_definition
-    from tartiflette.coercers.outputs.compute import get_output_coercer
     
     field_node = field_nodes[0]
     field_name = field_node.name.value
@@ -128,6 +164,7 @@ async def resolve_field_serial(
         resolver_func = field_definition.raw_resolver
 
     # Get serial output_coercer (with concurrently=False for serial execution)
+    from tartiflette.coercers.outputs.compute import get_output_coercer
     output_coercer = get_output_coercer(
         field_definition.graphql_type, concurrently=False
     )
@@ -175,6 +212,53 @@ async def execute_fields_serial(
     results = []
     for entry_key, field_nodes in fields.items():
         try:
+            field_definition = get_field_definition(
+                execution_context.schema, parent_type, field_nodes[0].name.value
+            )
+            
+            # Early optimization: try to get field value from source before calling resolve_field
+            # Only applies when:
+            # 1. Field definition exists
+            # 2. No directives on field nodes (quick check without computing)
+            # 3. Field has no arguments
+            # 4. Using default resolver (no custom resolver)
+            # 5. Optimization flag is enabled
+            # 6. Not introspection context
+            if (field_definition is not None
+                and not any(field_node.directives for field_node in field_nodes)
+                and not field_definition.arguments
+                and field_definition.raw_resolver is None
+                and execution_context.schema.skip_resolved_field_default_resolver
+                and not is_introspection_context):
+                field_value = _try_get_field_from_source(source_value, entry_key)
+                if field_value is not None:
+                    # Value found in source, build info and coerce value
+                    field_path = Path(path, entry_key)
+                    info = build_resolve_info(
+                        execution_context,
+                        field_definition,
+                        field_nodes,
+                        parent_type,
+                        field_path,
+                        is_introspection_context,
+                    )
+                    # Get serial output_coercer (with concurrently=False)
+                    from tartiflette.coercers.outputs.compute import get_output_coercer
+                    output_coercer = get_output_coercer(
+                        field_definition.graphql_type, concurrently=False
+                    )
+                    result = await complete_value_catching_error_serial(
+                        field_value,
+                        info,
+                        execution_context,
+                        field_nodes,
+                        field_path,
+                        field_definition.graphql_type,
+                        output_coercer,
+                    )
+                    results.append(result)
+                    continue
+            
             result = await resolve_field_serial(
                 execution_context,
                 parent_type,
@@ -284,6 +368,52 @@ async def execute_fields(
         if field_definition is None:
             results.append(UNDEFINED_VALUE)
             continue
+
+        # Early optimization: try to get field value from source before calling resolve_field
+        # Only applies when:
+        # 1. No directives on field nodes (quick check without computing)
+        # 2. Field has no arguments
+        # 3. Using default resolver (no custom resolver)
+        # 4. Optimization flag is enabled
+        # 5. Not introspection context
+        if (not any(field_node.directives for field_node in field_nodes)
+            and not field_definition.arguments
+            and field_definition.raw_resolver is None
+            and execution_context.schema.skip_resolved_field_default_resolver
+            and not is_introspection_context):
+            field_value = _try_get_field_from_source(source_value, entry_key)
+            if field_value is not None:
+                # Value found in source, build info and coerce value
+                field_path = Path(path, entry_key)
+                info = build_resolve_info(
+                    execution_context,
+                    field_definition,
+                    field_nodes,
+                    parent_type,
+                    field_path,
+                    is_introspection_context,
+                )
+                # Get output_coercer (with concurrently based on parent_concurrently)
+                from tartiflette.coercers.outputs.compute import get_output_coercer
+                output_coercer = get_output_coercer(
+                    field_definition.graphql_type, concurrently=field_definition.parent_concurrently
+                )
+                coerce_result = complete_value_catching_error(
+                    field_value,
+                    info,
+                    execution_context,
+                    field_nodes,
+                    field_path,
+                    field_definition.graphql_type,
+                    output_coercer,
+                )
+                # Handle concurrent vs non-concurrent execution
+                if field_definition.parent_concurrently:
+                    to_await[index] = coerce_result
+                    results.append(None)
+                else:
+                    results.append(await coerce_result)
+                continue
 
         result = field_definition.resolver(
             execution_context,

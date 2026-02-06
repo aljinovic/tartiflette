@@ -1,7 +1,6 @@
 from typing import Any, Callable, Dict, List
 
 from tartiflette.execution.collect import collect_subfields
-from tartiflette.execution.execute import execute_fields, execute_fields_serial
 from tartiflette.utils.errors import located_error
 
 __all__ = (
@@ -161,6 +160,7 @@ async def complete_object_value(
     :return: the computed value
     :rtype: Dict[str, Any]
     """
+    from tartiflette.execution.execute import execute_fields
     return await execute_fields(
         execution_context,
         return_type,
@@ -202,6 +202,7 @@ async def complete_object_value_serial(
     if result is None:
         return None
     
+    from tartiflette.execution.execute import execute_fields_serial
     subfields = await collect_subfields(execution_context, return_type, field_nodes)
     return await execute_fields_serial(
         execution_context,
