@@ -4,7 +4,7 @@ from inspect import (
     isfunction,
     ismethod,
 )
-from typing import AsyncGenerator, Coroutine
+from typing import AsyncGenerator, Callable, Coroutine
 
 
 def is_valid_coroutine(coroutine: Coroutine) -> bool:
@@ -39,3 +39,33 @@ def is_valid_async_generator(generator: AsyncGenerator) -> bool:
         if isfunction(generator) or ismethod(generator)
         else generator.__call__
     )
+
+
+def is_sync_callable(callable_obj: Callable) -> bool:
+    """
+    Determines whether or not the filled in parameter is a synchronous callable.
+    :param callable_obj: object to check
+    :type callable_obj: Callable
+    :return: whether or not the filled in parameter is a synchronous callable
+    :rtype: bool
+    """
+    if not callable(callable_obj):
+        return False
+    
+    # Check if it's a coroutine function (async)
+    if iscoroutinefunction(
+        callable_obj
+        if isfunction(callable_obj) or ismethod(callable_obj)
+        else callable_obj.__call__
+    ):
+        return False
+    
+    # Check if it's an async generator function
+    if isasyncgenfunction(
+        callable_obj
+        if isfunction(callable_obj) or ismethod(callable_obj)
+        else callable_obj.__call__
+    ):
+        return False
+    
+    return True

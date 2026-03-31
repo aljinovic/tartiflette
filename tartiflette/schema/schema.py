@@ -181,6 +181,7 @@ class GraphQLSchema:
         self.default_arguments_coercer: Optional[Callable] = None
         self.coerce_list_concurrently: Optional[bool] = None
         self.coerce_parent_concurrently: Optional[bool] = None
+        self.skip_resolved_field_default_resolver: bool = True
 
         # Operation type names
         self.query_operation_name: str = _DEFAULT_QUERY_OPERATION_NAME
@@ -1120,6 +1121,7 @@ class GraphQLSchema:
         custom_default_arguments_coercer: Optional[Callable] = None,
         coerce_list_concurrently: Optional[bool] = None,
         coerce_parent_concurrently: Optional[bool] = None,
+        skip_resolved_field_default_resolver: Optional[bool] = None,
     ) -> None:
         """
         Bake the final schema (it should not change after this) used for
@@ -1135,11 +1137,15 @@ class GraphQLSchema:
         concurrently
         :param coerce_parent_concurrently: whether or not field will be coerced
         concurrently
+        :param skip_resolved_field_default_resolver: if True, enable the optimization
+        that tries to get field values directly from source objects before calling
+        the resolver
         :type custom_default_resolver: Optional[Callable]
         :type custom_default_type_resolver: Optional[Callable]
         :type custom_default_arguments_coercer: Optional[Callable]
         :type coerce_list_concurrently: Optional[bool]
         :type coerce_parent_concurrently: Optional[bool]
+        :type skip_resolved_field_default_resolver: Optional[bool]
         """
         self.default_type_resolver = (
             custom_default_type_resolver or default_type_resolver
@@ -1155,6 +1161,11 @@ class GraphQLSchema:
         self.coerce_parent_concurrently = (
             coerce_parent_concurrently
             if coerce_parent_concurrently is not None
+            else True
+        )
+        self.skip_resolved_field_default_resolver = (
+            skip_resolved_field_default_resolver
+            if skip_resolved_field_default_resolver is not None
             else True
         )
         self._inject_introspection_fields()

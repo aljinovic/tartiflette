@@ -4,6 +4,7 @@ from typing import Any, Coroutine, Dict, List, Optional, Union
 
 __all__ = (
     "default_field_resolver",
+    "default_field_resolver_sync",
     "default_type_resolver",
     "gather_arguments_coercer",
     "sync_arguments_coercer",
@@ -19,6 +20,39 @@ async def default_field_resolver(
     """
     Default callable to use as resolver for field which doesn't implement a
     custom one.
+    :param parent: default root value or field parent value
+    :param args: computed arguments related to the resolved field
+    :param ctx: context passed to the query execution
+    :param info: information related to the execution and the resolved field
+    :type parent: Optional[Any]
+    :type args: Dict[str, Any]
+    :type ctx: Optional[Any]
+    :type info: ResolveInfo
+    :return: the computed field value
+    :rtype: Any
+    """
+    # pylint: disable=unused-argument
+    try:
+        return getattr(parent, info.field_name)
+    except AttributeError:
+        pass
+
+    try:
+        return parent[info.field_name]
+    except (KeyError, TypeError):
+        pass
+    return None
+
+
+def default_field_resolver_sync(
+    parent: Optional[Any],
+    args: Dict[str, Any],
+    ctx: Optional[Any],
+    info: "ResolveInfo",
+) -> Any:
+    """
+    Synchronous version of default_field_resolver for use in serial execution.
+    This avoids await overhead for fields without custom resolvers.
     :param parent: default root value or field parent value
     :param args: computed arguments related to the resolved field
     :param ctx: context passed to the query execution

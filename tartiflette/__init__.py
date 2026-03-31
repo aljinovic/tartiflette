@@ -36,6 +36,8 @@ async def create_engine(
     coerce_list_concurrently: Optional[bool] = None,
     coerce_parent_concurrently: Optional[bool] = None,
     sdl_file_encoding: Optional[str] = None,
+    execute_serially: bool = False,
+    skip_resolved_field_default_resolver: bool = True,
 ) -> "Engine":
     """
     Create an engine by analyzing the SDL and connecting it with the imported
@@ -66,6 +68,11 @@ async def create_engine(
     concurrently
     :param sdl_file_encoding: file encoding of the SDL, if different from
     `locale.getpreferredencoding(False)`
+    :param execute_serially: if True, fields are resolved serially one by one
+    without using asyncio.gather for concurrent execution
+    :param skip_resolved_field_default_resolver: if True, enable the optimization
+    that tries to get field values directly from source objects before calling
+    the resolver
     :type sdl: Union[str, List[str]]
     :type schema_name: str
     :type error_coercer: Callable[[Exception, Dict[str, Any]], Dict[str, Any]]
@@ -78,6 +85,8 @@ async def create_engine(
     :type coerce_list_concurrently: Optional[bool]
     :type coerce_parent_concurrently: Optional[bool]
     :type sdl_file_encoding: Optional[str]
+    :type execute_serially: bool
+    :type skip_resolved_field_default_resolver: bool
     :return: a Cooked Engine instance
     :rtype: Engine
 
@@ -91,7 +100,10 @@ async def create_engine(
     >>> }''')
     """
     # pylint: disable=too-many-arguments
-    e = Engine()
+    e = Engine(
+        execute_serially=execute_serially,
+        skip_resolved_field_default_resolver=skip_resolved_field_default_resolver,
+    )
 
     await e.cook(
         sdl=sdl,
@@ -106,6 +118,7 @@ async def create_engine(
         coerce_list_concurrently=coerce_list_concurrently,
         coerce_parent_concurrently=coerce_parent_concurrently,
         sdl_file_encoding=sdl_file_encoding,
+        skip_resolved_field_default_resolver=skip_resolved_field_default_resolver,
     )
 
     return e

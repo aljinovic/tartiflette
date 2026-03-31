@@ -4,6 +4,7 @@ from functools import partial
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Union
 
 from tartiflette.constants import UNDEFINED_VALUE
+from tartiflette.utils.callables import is_sync_callable
 from tartiflette.utils.values import is_invalid_value
 
 __all__ = ("introspection_directives_executor", "wraps_with_directives")
@@ -197,14 +198,17 @@ async def directive_generator(
 
 async def resolver_executor(resolver: Callable, *args, **kwargs) -> Any:
     """
-    Wraos the execution of the raw resolver in order to pop the
+    Wraps the execution of the raw resolver in order to pop the
     `context_coercer` keyword arguments to avoid exception.
+    Handles both sync and async resolvers.
     :param resolver: callable to wrap
     :type resolver: Callable
     :return: resolved value
     :rtype: Any
     """
     kwargs.pop("context_coercer", None)
+    if is_sync_callable(resolver):
+        return resolver(*args, **kwargs)
     return await resolver(*args, **kwargs)
 
 
